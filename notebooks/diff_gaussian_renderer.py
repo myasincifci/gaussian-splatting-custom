@@ -3,7 +3,6 @@ import math
 
 import torch
 from tqdm import tqdm
-from renderer import project_gaussians, tile_gaussians, rasterize_tile_fast
 
 class DiffGaussRenderer(torch.nn.Module):
     def __init__(self) -> None:
@@ -42,18 +41,16 @@ class DiffGaussRenderer(torch.nn.Module):
             cy=self.H/2,
         )
 
-        tile_map = self._tile_gaussians(
+        self.tile_map = self._tile_gaussians(
             mu_, cov_
         )
 
-        for y in tqdm(range(len(tile_map))):
-            for x in range(len(tile_map[0])):
-                if tile_map[y][x]:
-                    rasterize_tile_fast(
-                        xys=mu_, covs=cov_, colors=self.cols, opacity=self.opcs,
-                        x_coord=x, y_coord=y, tile_size=self.tile_size,
-                        out_img=self.img,
-                        tile_map=tile_map
+        for y in tqdm(range(len(self.tile_map))):
+            for x in range(len(self.tile_map[0])):
+                if self.tile_map[y][x]:
+                    self._rasterize_tile_fast(
+                        xys=mu_, covs=cov_,
+                        x_coord=x, y_coord=y,
                     )
 
     def plot_img(self):
@@ -251,13 +248,12 @@ class DiffGaussRenderer(torch.nn.Module):
 
         return torch.exp(-(1/2)*x_m @ S_inv @ x_m.permute(0,2,1))
     
-    def rasterize_tile_fast(
+    def _rasterize_tile_fast(
         self,
         xys,
         covs,
         x_coord, 
         y_coord,
-        tile_map
     ):
         x_min, x_max = x_coord*self.tile_size, (x_coord+1)*self.tile_size
         y_min, y_max = y_coord*self.tile_size, (y_coord+1)*self.tile_size
@@ -267,10 +263,10 @@ class DiffGaussRenderer(torch.nn.Module):
 
         pixels_xy = torch.cat((x.reshape(1,-1),y.reshape(1,-1)), dim=0)
 
-        tile = tile_map[y_coord][x_coord]
+        tile = self.tile_map[y_coord][x_coord]
 
-        C = self.colors[None, tile]
-        O = self.opacity[None, tile]
+        C = self.cols[None, tile]
+        O = self.opcs[None, tile]
 
         P = torch.vmap(self._g_fast, in_dims=0)(
             pixels_xy[None].expand((len(tile), pixels_xy.shape[0], pixels_xy.shape[1])), 
