@@ -230,6 +230,35 @@ def rasterize_gaussians(
 
     return out_img
 
+def rasterize_tile(
+        xys,
+        covs,
+        colors,
+        opacity,
+        x_coord, 
+        y_coord,
+        tile_size,
+        out_img,
+        tile_map
+    ):
+    x_min, x_max = x_coord*tile_size, (x_coord+1)*tile_size
+    y_min, y_max = y_coord*tile_size, (y_coord+1)*tile_size
+    
+    x, y = torch.meshgrid(torch.arange(x_min, x_max), torch.arange(y_min, y_max))
+    x = x.reshape(1,-1); y = y.reshape(1, -1)
+
+    pixels_xy = torch.cat((x.reshape(1,-1),y.reshape(1,-1)), dim=0)
+
+    cum_alphas = torch.ones(1, tile_size, tile_size)
+    # for m, S, c, o in zip(xys, covs, colors, opacity):
+    for tile in tile_map[y_coord][x_coord]:
+        m, S, c, o = xys[tile], covs[tile], colors[tile], opacity[tile]
+        alpha = g(pixels_xy, m, S).view(1, tile_size, tile_size) * o
+        out_img[y_min:y_max, x_min:x_max] = out_img[y_min:y_max, x_min:x_max] + (alpha * c.view(3,1,1) * cum_alphas).permute((2,1,0))
+        cum_alphas = cum_alphas * (1 - alpha)
+
+    # return out_img
+
 def main():
     N = 1_000
 
