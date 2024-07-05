@@ -176,14 +176,29 @@ def tile_gaussians(xys, covs, tile_size, img_height, img_width):
 
 ### Rasterize ##################################################################
 
-def inv_2d(A):
-    A_inv = torch.tensor([
-        [A[1,1], -A[0,1]],
-        [-A[1,0], A[0,0]],
-    ])
+def inv_2d(A: torch.Tensor):
+    A_inv = A.new_empty(A.shape)
+    A_inv[0,0] = A[1,1]
+    A_inv[0,1] = -A[0,1]
+    A_inv[1,0] = -A[1,0]
+    A_inv[1,1] = A[0,0]
+
     A_inv *= 1/(A[0,0]*A[1,1]-A[0,1]*A[1,0])
 
     return A_inv
+
+def g_fast(x, m, S):
+    ''' x: (h*w, 2) matrix
+        m: (2, 1) mean
+        S: (2, 2) cov matrix
+    '''
+    x = x.T.view(-1, 1, 2)
+    m = m.view(1, 1, 2)
+
+    S_inv = inv_2d(S)
+    x_m = x - m
+
+    return torch.exp(-(1/2)*x_m @ S_inv @ x_m.permute(0,2,1))
 
 def g(x, m, S):
     ''' x: (h*w, 2) matrix
@@ -218,7 +233,8 @@ def rasterize_gaussians(
 
     # Sort mu_ by depth
     _, ind = torch.sort(depths)
-    xys_, covs_, colors_ = xys[ind], covs[ind], colors[ind]
+    # xys_, covs_, colors_ = xys[ind], covs[ind], colors[ind]
+    xys_, covs_, colors_ = xys, covs, colors
 
     out_img = torch.zeros(img_height, img_width, 3)
     pixels_xy = torch.cat((x.reshape(1,-1),y.reshape(1,-1)), dim=0)
@@ -229,6 +245,46 @@ def rasterize_gaussians(
         cum_alphas = cum_alphas * (1 - alpha)
 
     return out_img
+
+def rasterize_gaussians_fast(
+        xys, 
+        depths, 
+        covs, 
+        conics, 
+        num_tiles_hit, 
+        colors, 
+        opacity, 
+        img_height, 
+        img_width, 
+        block_width, 
+        background=None, 
+        return_alpha=False
+    ):
+    x, y = torch.meshgrid(torch.linspace(0,img_width,img_width),torch.linspace(0,img_height,img_height), indexing='xy')
+    x = x.reshape(1,-1); y = y.reshape(1, -1)
+    pixels_xy = torch.cat((x.reshape(1,-1),y.reshape(1,-1)), dim=0)
+
+
+    # Sort mu_ by depth
+    # _, ind = torch.sort(depths)
+    # xys_, covs_, colors_ = xys[ind], covs[ind], colors[ind]
+
+    C = colors[None]
+    O = opacity[None]
+
+    P = torch.vmap(g_fast, in_dims=0)(
+        pixels_xy[None].expand((len(opacity), pixels_xy.shape[0], pixels_xy.shape[1])), 
+        xys, covs).permute((1,0,2,3)).squeeze(dim=(2,3))
+
+    A = O * P
+    D = (1 - A)
+    D = torch.cat((torch.ones(A.shape[0], 1), D[:,:-1]), dim=1).contiguous()
+    D = D.cumprod(dim=1)
+
+    RGB = (C*A[:,:,None]*D[:,:,None])
+    RGB = RGB.sum(dim=1)
+
+    return RGB
 
 def rasterize_tile(
         xys,
@@ -259,8 +315,46 @@ def rasterize_tile(
 
     # return out_img
 
+def rasterize_tile_fast(
+        xys,
+        covs,
+        colors,
+        opacity,
+        x_coord, 
+        y_coord,
+        tile_size,
+        out_img,
+        tile_map
+    ):
+    x_min, x_max = x_coord*tile_size, (x_coord+1)*tile_size
+    y_min, y_max = y_coord*tile_size, (y_coord+1)*tile_size
+    
+    x, y = torch.meshgrid(torch.arange(x_min, x_max), torch.arange(y_min, y_max))
+    x = x.reshape(1,-1); y = y.reshape(1, -1)
+
+    pixels_xy = torch.cat((x.reshape(1,-1),y.reshape(1,-1)), dim=0)
+
+    tile = tile_map[y_coord][x_coord]
+
+    C = colors[None, tile]
+    O = opacity[None, tile]
+
+    P = torch.vmap(g_fast, in_dims=0)(
+        pixels_xy[None].expand((len(tile), pixels_xy.shape[0], pixels_xy.shape[1])), 
+        xys[tile], covs[tile]).permute((1,0,2,3)).squeeze(dim=(2,3))
+
+    A = O * P
+    D = (1 - A)
+    D = torch.cat((torch.ones(A.shape[0], 1), D[:,:-1]), dim=1).contiguous()
+    D = D.cumprod(dim=1)
+
+    RGB = (C*A[:,:,None]*D[:,:,None])
+    RGB = RGB.sum(dim=1)
+
+    out_img[y_min:y_max, x_min:x_max] = RGB.view(tile_size, tile_size, 3).permute(1,0,2)
+
 def main():
-    N = 1_000
+    N = 1000
 
     mu = (torch.rand((N,3)) - 0.5) * 4.
     scale = torch.rand((N,3)) * 0.2
@@ -269,8 +363,8 @@ def main():
     opc = torch.rand((N,))
 
     # Output Image Width and Height
-    W = 1290 
-    H =  720
+    W = 1200
+    H = 600
 
     fov_x = math.pi / 2.0 # Angle of the camera frustum 90°
     focal = 0.5 * float(W) / math.tan(0.5 * fov_x) # Distance to Image Plane
@@ -286,6 +380,7 @@ def main():
         means3d=mu,
         scales=scale,
         quats=quat,
+        colors=col,
         viewmat=viewmat,
         fx=focal,
         fy=focal,
@@ -295,7 +390,21 @@ def main():
         img_width=W
     )
 
-    out_img = rasterize_gaussians(
+    tile_size = 20
+    tile_map = tile_gaussians(mu_, cov_, tile_size, H, W)
+
+    out_img = torch.zeros(H, W, 3)
+    for y in tqdm(range(len(tile_map))):
+        for x in range(len(tile_map[0])):
+            if tile_map[y][x]:
+                rasterize_tile_fast(
+                    xys=mu_, covs=cov_, colors=col, opacity=opc,
+                    x_coord=x, y_coord=y, tile_size=tile_size,
+                    out_img=out_img,
+                    tile_map=tile_map
+                )
+
+    out_img_gt = rasterize_gaussians(
         xys=mu_,
         depths=z,
         covs=cov_,
@@ -310,17 +419,9 @@ def main():
         return_alpha=None
     )
 
-    fig, (ax1, ax2) = plt.subplots(1, 2)
+    fig, (ax1, ax2) = plt.subplots(1,2,)
     ax1.matshow(out_img)
-
-    ellipse_ndim(mu_, cov_, ax2, edgecolor='red')
-    for m in mu_:
-        ax2.scatter(m[0], m[1])
-    # ax2.scatter(mu_[1,0], mu_[1,1])
-    ax2.set_aspect('equal', adjustable='box')
-
-    ax2.set_xlim([0,W])
-    ax2.set_ylim([0,H])
+    ax2.matshow(out_img_gt.flip(dims=[0]))
 
     plt.show()
 
