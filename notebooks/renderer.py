@@ -369,8 +369,8 @@ def main():
     opc = torch.rand((N,), device=device)
 
     # Output Image Width and Height
-    W = 1200
-    H = 600
+    W = 960
+    H = 540
 
     fov_x = math.pi / 2.0 # Angle of the camera frustum 90°
     focal = 0.5 * float(W) / math.tan(0.5 * fov_x) # Distance to Image Plane
