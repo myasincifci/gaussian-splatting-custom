@@ -1,21 +1,23 @@
 import torch
+
+import time
 from tqdm import tqdm
 
 ### Project ##################################################################
 
-def P(f_x, f_y, h, w, n, f):
+def P(f_x, f_y, h, w, n, f, device):
     P = torch.tensor([
         [2.*f_x/w, 0., 0., 0.],
         [0., 2.*f_y/h, 0., 0.],
         [0., 0., (f+n)/(f-n), -2*f*n/(f-n)],
         [0., 0., 1., 0.],
-    ])
+    ], device=device)
 
     return P
 
 def J(f_x, f_y, t_x, t_y, t_z):
     N = len(t_x)
-    J = torch.zeros((N,2,3))
+    J = torch.zeros((N,2,3), device=t_x.device)
     J[:,0,0] = f_x/t_z
     J[:,1,1] = f_y/t_z
     J[:,0,2] = -f_x*t_x/t_z**2
@@ -27,7 +29,7 @@ def quat_to_rot(quaternion):
     N = quaternion.shape[0]
     x, y, z, w = quaternion[:,0],quaternion[:,1],quaternion[:,2],quaternion[:,3],
 
-    R = torch.empty((N,3,3))
+    R = torch.empty((N,3,3),device=quaternion.device)
     
     R[:,0,0] = 1-2*(y**2+z**2)
     R[:,0,1] = 2*(x*y-w*z)
@@ -57,13 +59,14 @@ def project_gaussians(
         img_height, 
         img_width, 
         # block_width, 
-        clip_thresh=0.01
+        clip_thresh=0.01,
+        device='cpu'
     ):
     N = means3d.shape[0]
 
     # Project Means
-    t = viewmat @ torch.cat((means3d.T, torch.ones(1, N)), dim=0) # (4, 4) x (4, N) = (4, N)
-    t_ = P(fx, fy, img_height, img_width, clip_thresh, 10) @ t # (4, 4) x (4, N) = (4, N)
+    t = viewmat @ torch.cat((means3d.T, torch.ones(1, N, device=device)), dim=0) # (4, 4) x (4, N) = (4, N)
+    t_ = P(fx, fy, img_height, img_width, clip_thresh, 10, device=device) @ t # (4, 4) x (4, N) = (4, N)
 
     xys = torch.vstack((
         (img_width*t_[0]/t_[3])/2+cx, # old: (img_width*t_[0]/t_[3]+1.)/2+cx,
@@ -100,7 +103,7 @@ def get_eigenvalues(cov):
 def get_radii(cov):
     eigs = get_eigenvalues(cov)
     l1, l2 = eigs[0], eigs[1]
-    s = 2
+    s = 3
     return s * torch.sqrt(l1), s * torch.sqrt(l2) # TODO: change to 3 * sigma
 
 def get_box(mu, cov):
@@ -196,6 +199,7 @@ def g_fast(x, m, S):
     m = m.view(1, 1, 2)
 
     S_inv = inv_2d(S)
+
     x_m = x - m
 
     return torch.exp(-(1/2)*x_m @ S_inv @ x_m.permute(0,2,1))
@@ -329,7 +333,7 @@ def rasterize_tile_fast(
     x_min, x_max = x_coord*tile_size, (x_coord+1)*tile_size
     y_min, y_max = y_coord*tile_size, (y_coord+1)*tile_size
     
-    x, y = torch.meshgrid(torch.arange(x_min, x_max), torch.arange(y_min, y_max))
+    x, y = torch.meshgrid(torch.arange(x_min, x_max, device=xys.device), torch.arange(y_min, y_max, device=xys.device))
     x = x.reshape(1,-1); y = y.reshape(1, -1)
 
     pixels_xy = torch.cat((x.reshape(1,-1),y.reshape(1,-1)), dim=0)
@@ -345,7 +349,7 @@ def rasterize_tile_fast(
 
     A = O * P
     D = (1 - A)
-    D = torch.cat((torch.ones(A.shape[0], 1), D[:,:-1]), dim=1).contiguous()
+    D = torch.cat((torch.ones(A.shape[0], 1, device=xys.device), D[:,:-1]), dim=1).contiguous()
     D = D.cumprod(dim=1)
 
     RGB = (C*A[:,:,None]*D[:,:,None])
@@ -354,13 +358,15 @@ def rasterize_tile_fast(
     out_img[y_min:y_max, x_min:x_max] = RGB.view(tile_size, tile_size, 3).permute(1,0,2)
 
 def main():
-    N = 1000
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    mu = (torch.rand((N,3)) - 0.5) * 4.
-    scale = torch.rand((N,3)) * 0.2
-    quat = torch.rand((N, 4))
-    col = torch.rand((N, 3))
-    opc = torch.rand((N,))
+    N = 100_000
+
+    mu = (torch.rand((N,3), device=device) - 0.5) * 5.
+    scale = torch.rand((N,3), device=device) * 0.05
+    quat = torch.rand((N, 4), device=device)
+    col = torch.rand((N, 3), device=device)
+    opc = torch.rand((N,), device=device)
 
     # Output Image Width and Height
     W = 1200
@@ -369,7 +375,7 @@ def main():
     fov_x = math.pi / 2.0 # Angle of the camera frustum 90°
     focal = 0.5 * float(W) / math.tan(0.5 * fov_x) # Distance to Image Plane
 
-    viewmat = torch.eye(4)
+    viewmat = torch.eye(4, device=device)
     viewmat[:3,3] = torch.tensor([0,0,-4])
 
     (
@@ -387,7 +393,8 @@ def main():
         cx=W/2,
         cy=H/2,
         img_height=H,
-        img_width=W
+        img_width=W,
+        device=device
     )
 
     tile_size = 20
@@ -404,24 +411,9 @@ def main():
                     tile_map=tile_map
                 )
 
-    out_img_gt = rasterize_gaussians(
-        xys=mu_,
-        depths=z,
-        covs=cov_,
-        conics=None,
-        num_tiles_hit=None,
-        colors=col,
-        opacity=opc,
-        img_height=H,
-        img_width=W,
-        block_width=None,
-        background=None,
-        return_alpha=None
-    )
 
-    fig, (ax1, ax2) = plt.subplots(1,2,)
+    fig, ax1 = plt.subplots(1,1,)
     ax1.matshow(out_img)
-    ax2.matshow(out_img_gt.flip(dims=[0]))
 
     plt.show()
 
