@@ -10,7 +10,7 @@ class DiffGaussRenderer(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         
-        self.N = 10_000
+        self.N = 20_000
         self.W, self.H = (256, 256)
         
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -366,7 +366,7 @@ def main():
 
     # torch.autograd.set_detect_anomaly(True)
 
-    for iter in tqdm(range(30)):
+    for iter in tqdm(range(100)):
         optimizer.zero_grad()
 
         pred = renderer.render()
@@ -376,6 +376,10 @@ def main():
         optimizer.step()
 
         print(f'Iter: {iter}, Loss: {loss.item()}')
+
+        if iter % 10 == 0:
+            plt.matshow(pred.detach().cpu())
+            plt.show()
 
     plt.matshow(pred.detach().cpu())
     plt.show()
