@@ -2,16 +2,19 @@ import sys
 import math
 
 import torch
+import torch.utils
 import torchvision
 from tqdm import tqdm
 
 import time
 
+import matplotlib.pyplot as plt
+
 class DiffGaussRenderer(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         
-        self.N = 20_000
+        self.N = 10_000
         self.W, self.H = (256, 256)
         
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -22,8 +25,9 @@ class DiffGaussRenderer(torch.nn.Module):
         self.viewmat = torch.eye(4, device=self.device)
         self.viewmat[:3,3] = torch.tensor([0,0,-4])
 
-        self.mu = (torch.rand((self.N,3), device=self.device) - 0.5) * 5.
-        self.scales = torch.rand((self.N,3), device=self.device) * 0.05
+        self.mu = (torch.rand((self.N,3), device=self.device) - 0.5) * 8.
+        self.mu[:,2] = torch.rand((self.N))*0.001
+        self.scales = torch.rand((self.N,3), device=self.device) * 0.1
         self.quats = torch.rand((self.N, 4), device=self.device)
         self.cols = torch.rand((self.N, 3), device=self.device)
         self.opcs = torch.rand((self.N,), device=self.device)
@@ -69,7 +73,7 @@ class DiffGaussRenderer(torch.nn.Module):
         #     coords
         # )
 
-        self.img = torch.empty_like(self.img)
+        self.img = torch.zeros_like(self.img)
         for y in tqdm(range(len(self.tile_map))):
             for x in range(len(self.tile_map[0])):
                 if self.tile_map[y][x]:
@@ -85,8 +89,6 @@ class DiffGaussRenderer(torch.nn.Module):
         return self.img[:]
 
     def plot_img(self):
-        import matplotlib.pyplot as plt
-
         plt.matshow(self.img)
         plt.show()
 
@@ -237,6 +239,8 @@ class DiffGaussRenderer(torch.nn.Module):
         
         # Compute Bounding-Boxes
         bbs = self._get_bounding_boxes(xys, covs)
+        bbs[bbs.isnan()] = -1.
+
         tile_map = [[[] for tw in range(self.W//self.tile_size)] for th in range(self.H//self.tile_size)]
 
         minmax = torch.cat(((bbs.amin(dim=1) / self.tile_size).floor()[:,:,None], (bbs.amax(dim=1) / self.tile_size).ceil()[:,:,None]), dim=2)
@@ -275,9 +279,9 @@ class DiffGaussRenderer(torch.nn.Module):
 
         S_inv = self._inv_2d(S)
 
-        x_m = x - m
+        x_m = x - m + 1e-5
 
-        return torch.exp(-(1/2)*x_m @ S_inv @ x_m.permute(0,2,1))
+        return torch.exp(-(1/2)*x_m @ (S_inv + 1e-5) @ x_m.permute(0,2,1) + 1e-5)
     
     def _rasterize_tile_fast(
         self,
@@ -296,20 +300,31 @@ class DiffGaussRenderer(torch.nn.Module):
 
         tile = self.tile_map[y_coord][x_coord]
 
-        C = self.cols[None, tile]
-        O = self.opcs[None, tile]
+        xys = xys.clamp(min=0, max=float(self.H))
+
+        C = self.cols[None, tile].clamp(min=0.0001, max=1.)
+        O = self.opcs[None, tile].clamp(min=0.0001, max=1.)
 
         P = torch.vmap(self._g_fast, in_dims=0)(
             pixels_xy[None].expand((len(tile), pixels_xy.shape[0], pixels_xy.shape[1])), 
             xys[tile], covs[tile]).permute((1,0,2,3)).squeeze(dim=(2,3))
+        P = P.clip(max=0.999, min=0.001)
 
         A = O * P
+        A[A<0.001] = 0.
+        A = A.clip(max=0.99)
+
         D = (1 - A)
         D = torch.cat((torch.ones(A.shape[0], 1, device=xys.device), D[:,:-1]), dim=1).contiguous()
+        D = D
         D = D.cumprod(dim=1)
 
-        RGB = (C*A[:,:,None]*D[:,:,None])
-        RGB = RGB.sum(dim=1)
+        # RGB = ((C + 1e-6) * (A[:,:,None] + 1e-6) * (D[:,:,None]+ 1e-6)) # numerical stability
+
+        RGB = C * A[:,:,None]
+        RGB = RGB * D[:,:,None]
+
+        RGB = RGB.sum(dim=1).clamp(min=0.0001, max=1.)
 
         self.img[y_min:y_max, x_min:x_max] = RGB.view(self.tile_size, self.tile_size, 3).permute(1,0,2)
 
@@ -367,25 +382,35 @@ def main():
     criterion = torch.nn.L1Loss()
     optimizer = torch.optim.Adam(params=renderer.params, lr=1e-2)
 
-    # torch.autograd.set_detect_anomaly(True)
+    torch.autograd.set_detect_anomaly(True)
 
-    plt.matshow(gt_image.detach().cpu())
-    plt.show()
+    pred = renderer.render()
 
-    for iter in tqdm(range(50)):
+    plt.ion()
+    figure, ax = plt.subplots()
+    im1 = ax.matshow(pred.detach().cpu())
+    # plt.show()
+
+    for iter in tqdm(range(100)):
         optimizer.zero_grad()
 
         pred = renderer.render()
+
+        # plt.matshow(pred.detach().cpu())
+        # plt.show()
+        im1.set_data(pred.detach().cpu())
+        figure.canvas.draw()
+        figure.canvas.flush_events()
+        time.sleep(0.1)
+
         loss = criterion(pred, gt_image)
         
         loss.backward()
+
+        torch.nn.utils.clip_grad_value_(renderer.params, clip_value=1.0)
         optimizer.step()
 
-        print(f'Iter: {iter}, Loss: {loss.item()}')
-
-        # if iter % 5 == 0:
-        #     plt.matshow(pred.detach().cpu())
-        #     plt.show()
+        print(f'Iter: {iter}, Loss: {loss.item()}, Grad. Norms: {[p.abs().max().item() for p in renderer.params]}')
 
     plt.matshow(pred.detach().cpu())
     plt.show()
