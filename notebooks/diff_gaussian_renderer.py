@@ -2,6 +2,7 @@ import sys
 import math
 
 import torch
+import torchvision
 from tqdm import tqdm
 
 import time
@@ -356,17 +357,22 @@ def main():
 
     renderer = DiffGaussRenderer()
     
-    gt_image = torch.ones((renderer.H, renderer.W, 3)) * 1.0
-    # make top left and bottom right red, blue
-    gt_image[: renderer.H // 2, : renderer.W // 2, :] = torch.tensor([1.0, 0.0, 0.0])
-    gt_image[renderer.H // 2 :, renderer.W // 2 :, :] = torch.tensor([0.0, 0.0, 1.0])
+    # gt_image = torch.ones((renderer.H, renderer.W, 3)) * 1.0
+    # # make top left and bottom right red, blue
+    # gt_image[: renderer.H // 2, : renderer.W // 2, :] = torch.tensor([1.0, 0.0, 0.0])
+    # gt_image[renderer.H // 2 :, renderer.W // 2 :, :] = torch.tensor([0.0, 0.0, 1.0])
+
+    gt_image = torchvision.io.read_image('./mikey_cropped.jpg').permute(1,2,0) / 255
 
     criterion = torch.nn.L1Loss()
     optimizer = torch.optim.Adam(params=renderer.params, lr=1e-2)
 
     # torch.autograd.set_detect_anomaly(True)
 
-    for iter in tqdm(range(100)):
+    plt.matshow(gt_image.detach().cpu())
+    plt.show()
+
+    for iter in tqdm(range(50)):
         optimizer.zero_grad()
 
         pred = renderer.render()
@@ -377,9 +383,9 @@ def main():
 
         print(f'Iter: {iter}, Loss: {loss.item()}')
 
-        if iter % 10 == 0:
-            plt.matshow(pred.detach().cpu())
-            plt.show()
+        # if iter % 5 == 0:
+        #     plt.matshow(pred.detach().cpu())
+        #     plt.show()
 
     plt.matshow(pred.detach().cpu())
     plt.show()
