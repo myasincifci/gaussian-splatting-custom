@@ -4,12 +4,14 @@ import math
 import torch
 from tqdm import tqdm
 
+import time
+
 class DiffGaussRenderer(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         
-        self.N = 100_000
-        self.W, self.H = (960, 540)
+        self.N = 10_000
+        self.W, self.H = (256, 256)
         
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -25,15 +27,21 @@ class DiffGaussRenderer(torch.nn.Module):
         self.cols = torch.rand((self.N, 3), device=self.device)
         self.opcs = torch.rand((self.N,), device=self.device)
 
-        self.tile_size = 20
+        self.params = [self.mu, self.scales, self.quats, self.cols, self.opcs]
+        for param in self.params:
+            param.requires_grad = True
+
+        self.tile_size = 16
 
         self.img = torch.zeros(self.H, self.W, 3)
 
     def render(self):
+        start = time.time()
+
         (
-            mu_,
-            cov_,
-            z
+            self.mu_,
+            self.cov_,
+            self.z
         ) = self._project_gaussians(
             fx=self.focal,
             fy=self.focal,
@@ -41,17 +49,39 @@ class DiffGaussRenderer(torch.nn.Module):
             cy=self.H/2,
         )
 
+        project = time.time()
+
         self.tile_map = self._tile_gaussians(
-            mu_, cov_
+            self.mu_, self.cov_
         )
 
+        tile = time.time()
+
+        # xs = torch.arange(len(self.tile_map[0]))
+        # ys = torch.arange(len(self.tile_map))
+        # x, y = torch.meshgrid(xs, ys)
+        # x = x.reshape(1,-1); y = y.reshape(1, -1)
+
+        # coords = torch.cat((x.reshape(1,-1),y.reshape(1,-1)), dim=0)
+
+        # torch.vmap(self._rasterize_tile_faster, in_dims=1)(
+        #     coords
+        # )
+
+        self.img = torch.empty_like(self.img)
         for y in tqdm(range(len(self.tile_map))):
             for x in range(len(self.tile_map[0])):
                 if self.tile_map[y][x]:
                     self._rasterize_tile_fast(
-                        xys=mu_, covs=cov_,
+                        xys=self.mu_, covs=self.cov_,
                         x_coord=x, y_coord=y,
                     )
+
+        render = time.time()
+
+        print(f'Project: {project - start}, Tile: {tile - project}, Render: {render - tile}')
+
+        return self.img[:]
 
     def plot_img(self):
         import matplotlib.pyplot as plt
@@ -85,7 +115,7 @@ class DiffGaussRenderer(torch.nn.Module):
 
     def _quat_to_rot(self, quaternion):
         N = quaternion.shape[0]
-        x, y, z, w = quaternion[:,0],quaternion[:,1],quaternion[:,2],quaternion[:,3],
+        x, y, z, w = quaternion[:,0].clone() ,quaternion[:,1].clone() ,quaternion[:,2].clone() ,quaternion[:,3].clone(),
 
         R = torch.empty((N,3,3),device=self.device)
         
@@ -131,8 +161,8 @@ class DiffGaussRenderer(torch.nn.Module):
         R_cw = self.viewmat[:3,:3]
         covs = J_ @ R_cw @ Sigma @ R_cw.T @ J_.permute((0,2,1))
 
-        _, ind = torch.sort(depths)
-        xys, covs, self.cols = xys[ind], covs[ind], self.cols[ind]
+        # _, ind = torch.sort(depths)
+        # xys, covs, self.cols = xys[ind], covs[ind], self.cols[ind]
 
         return xys, covs, depths 
     
@@ -282,10 +312,73 @@ class DiffGaussRenderer(torch.nn.Module):
 
         self.img[y_min:y_max, x_min:x_max] = RGB.view(self.tile_size, self.tile_size, 3).permute(1,0,2)
 
+    def _rasterize_tile_faster(
+        self,
+        coord: torch.Tensor
+    ):
+        x_coord, y_coord = coord
+
+        x_min, x_max = x_coord*self.tile_size, (x_coord+1)*self.tile_size
+        y_min, y_max = y_coord*self.tile_size, (y_coord+1)*self.tile_size
+        
+        # xs = torch.arange(x_min, x_max, device=self.device)
+        # ys = torch.arange(y_min, y_max, device=self.device)
+        xs = torch.linspace(x_min, x_max-1, self.tile_size)
+        ys = torch.linspace(y_min, y_max-1, self.tile_size)
+
+        x, y = torch.meshgrid(xs, ys)
+        
+        x = x.reshape(1,-1); y = y.reshape(1, -1)
+
+        pixels_xy = torch.cat((x.reshape(1,-1),y.reshape(1,-1)), dim=0)
+
+        tile = self.tile_map[y_coord][x_coord]
+
+        C = self.cols[None, tile]
+        O = self.opcs[None, tile]
+
+        P = torch.vmap(self._g_fast, in_dims=0)(
+            pixels_xy[None].expand((len(tile), pixels_xy.shape[0], pixels_xy.shape[1])), 
+            self.mu_[tile], self.cov_[tile]).permute((1,0,2,3)).squeeze(dim=(2,3))
+
+        A = O * P
+        D = (1 - A)
+        D = torch.cat((torch.ones(A.shape[0], 1, device=self.device), D[:,:-1]), dim=1).contiguous()
+        D = D.cumprod(dim=1)
+
+        RGB = (C*A[:,:,None]*D[:,:,None])
+        RGB = RGB.sum(dim=1)
+
+        self.img[y_min:y_max, x_min:x_max] = RGB.view(self.tile_size, self.tile_size, 3).permute(1,0,2)
+
 def main():
+    import matplotlib.pyplot as plt
+
     renderer = DiffGaussRenderer()
-    renderer.render()
-    renderer.plot_img()
+    
+    gt_image = torch.ones((renderer.H, renderer.W, 3)) * 1.0
+    # make top left and bottom right red, blue
+    gt_image[: renderer.H // 2, : renderer.W // 2, :] = torch.tensor([1.0, 0.0, 0.0])
+    gt_image[renderer.H // 2 :, renderer.W // 2 :, :] = torch.tensor([0.0, 0.0, 1.0])
+
+    criterion = torch.nn.L1Loss()
+    optimizer = torch.optim.Adam(params=renderer.params, lr=1e-2)
+
+    # torch.autograd.set_detect_anomaly(True)
+
+    for iter in tqdm(range(30)):
+        optimizer.zero_grad()
+
+        pred = renderer.render()
+        loss = criterion(pred, gt_image)
+        
+        loss.backward()
+        optimizer.step()
+
+        print(f'Iter: {iter}, Loss: {loss.item()}')
+
+    plt.matshow(pred.detach().cpu())
+    plt.show()
 
 if __name__ == '__main__':
     main()
