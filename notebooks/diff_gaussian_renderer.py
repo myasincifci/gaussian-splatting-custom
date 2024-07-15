@@ -382,22 +382,19 @@ def main():
     criterion = torch.nn.L1Loss()
     optimizer = torch.optim.Adam(params=renderer.params, lr=1e-2)
 
-    torch.autograd.set_detect_anomaly(True)
+    # torch.autograd.set_detect_anomaly(True)
 
     pred = renderer.render()
 
     plt.ion()
     figure, ax = plt.subplots()
     im1 = ax.matshow(pred.detach().cpu())
-    # plt.show()
 
     for iter in tqdm(range(100)):
         optimizer.zero_grad()
 
         pred = renderer.render()
 
-        # plt.matshow(pred.detach().cpu())
-        # plt.show()
         im1.set_data(pred.detach().cpu())
         figure.canvas.draw()
         figure.canvas.flush_events()
@@ -408,9 +405,12 @@ def main():
         loss.backward()
 
         torch.nn.utils.clip_grad_value_(renderer.params, clip_value=1.0)
+        for param in renderer.params:
+            param.grad[param.grad.isnan()] = 0.
+
         optimizer.step()
 
-        print(f'Iter: {iter}, Loss: {loss.item()}, Grad. Norms: {[p.abs().max().item() for p in renderer.params]}')
+        print(f'Iter: {iter}, Loss: {loss.item()}, Grad. Norms: {[p.abs().norm().item() for p in renderer.params]}')
 
     plt.matshow(pred.detach().cpu())
     plt.show()
