@@ -11,10 +11,10 @@ import time
 import matplotlib.pyplot as plt
 
 class DiffGaussRenderer(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, N, params=None) -> None:
         super().__init__()
         
-        self.N = 10_000
+        self.N = N
         self.W, self.H = (256, 256)
         
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -25,16 +25,17 @@ class DiffGaussRenderer(torch.nn.Module):
         self.viewmat = torch.eye(4, device=self.device)
         self.viewmat[:3,3] = torch.tensor([0,0,-4])
 
-        self.mu = (torch.rand((self.N,3), device=self.device) - 0.5) * 8.
-        self.mu[:,2] = torch.rand((self.N))*0.001
-        self.scales = torch.rand((self.N,3), device=self.device) * 0.1
-        self.quats = torch.rand((self.N, 4), device=self.device)
-        self.cols = torch.rand((self.N, 3), device=self.device)
-        self.opcs = torch.rand((self.N,), device=self.device)
+        if not params:
+            self.mu = (torch.rand((self.N,3), device=self.device) - 0.5) * 8.
+            self.mu[:,2] = torch.rand((self.N))*0.001
+            self.scales = torch.rand((self.N,3), device=self.device) * 0.1
+            self.quats = torch.rand((self.N, 4), device=self.device)
+            self.cols = torch.rand((self.N, 3), device=self.device)
+            self.opcs = torch.rand((self.N,), device=self.device)
+        else:
+            self.params = params
 
-        self.params = [self.mu, self.scales, self.quats, self.cols, self.opcs]
-        for param in self.params:
-            param.requires_grad = True
+        self.register_params()
 
         self.tile_size = 16
 
@@ -45,7 +46,7 @@ class DiffGaussRenderer(torch.nn.Module):
         for param in self.params:
             param.requires_grad = True
 
-    def set_ground_truth(self, viewmat):
+    def set_viewmat(self, viewmat):
         self.viewmat = viewmat
 
     def render(self):
